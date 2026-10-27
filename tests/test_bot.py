@@ -76,6 +76,19 @@ class GameTests(unittest.TestCase):
         self.assertTrue(1 <= int(self.run_command('/roll').split()[-1]) <= 100)
         self.assertIsNone(self.run_command('/grow@otherbot'))
 
+    def test_growth_probability_boundary_and_magnitude(self):
+        for user, roll, positive in ((101, 0.0, True), (102, 0.699999, True),
+                                     (103, 0.7, False), (104, 0.999999, False)):
+            with self.subTest(roll=roll):
+                with patch.object(self.game.rng, 'random', return_value=roll):
+                    with patch.object(self.game.rng, 'randint', return_value=6) as magnitude:
+                        answer = self.run_command('/писюн', user=user)
+                magnitude.assert_called_once_with(1, 10)
+                length = self.game.db.execute(
+                    'SELECT length FROM players WHERE chat=? AND user=?', (-1, user)).fetchone()[0]
+                self.assertEqual(length, 6 if positive else -6)
+                self.assertIn('виріс' if positive else 'зменшився', answer)
+
     def test_chunking(self):
         parts = list(chunks('\n'.join(['А' * 100] * 100)))
         self.assertGreater(len(parts), 1)
