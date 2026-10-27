@@ -18,12 +18,6 @@ ALIASES = {
     '/grow': '/писюн', '/mine': '/мой_писюн', '/top': '/топ',
     '/top_all': '/топ_все', '/chat': '/чат', '/roll': '/ролл',
 }
-KEYBOARD = {
-    'keyboard': [['/писюн', '/мой_писюн'], ['/топ', '/топ_все'], ['/чат', '/ролл'], ['/help']],
-    'resize_keyboard': True,
-    'is_persistent': True,
-    'one_time_keyboard': False,
-}
 HELP = ('Команди гри:\n/писюн — змінити довжину раз на день на ±1–10 см\n'
         '/мой_писюн — твоя довжина\n/топ — топ 10\n/топ_все — усі гравці\n'
         'Шанс зростання — 70%, зменшення — 30%.\n'
@@ -144,7 +138,7 @@ def main():
                 answer = game.handle(message, me['username'])
                 if answer:
                     for part in chunks(answer):
-                        api.call('sendMessage', chat_id=message['chat']['id'], text=part, reply_markup=KEYBOARD)
+                        api.call('sendMessage', chat_id=message['chat']['id'], text=part, reply_markup={'remove_keyboard': True})
                 offset = update['update_id'] + 1
         except KeyboardInterrupt:
             break
