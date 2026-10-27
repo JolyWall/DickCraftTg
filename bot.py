@@ -13,11 +13,11 @@ from zoneinfo import ZoneInfo
 
 LOG = logging.getLogger(__name__)
 COMMANDS = {'/писюн', '/топ', '/топ_все', '/чат', '/ролл', '/мой_писюн', '/help', '/start'}
-HELP = ('Команды игры:\n/писюн — изменить длину раз в день на ±1–10 см\n'
-        '/мой_писюн — ваша длина\n/топ — топ 10\n/топ_все — все игроки\n'
-        '/чат — суммарная длина\n/ролл — число от 1 до 100\n'
-        'Новый день — в 00:00 по часовому поясу игры (по умолчанию Москва). '
-        'Начальная длина — 0 см; длина может быть отрицательной. Рейтинги включают игроков, использовавших /писюн.')
+HELP = ('Команди гри:\n/писюн — змінити довжину раз на день на ±1–10 см\n'
+        '/мой_писюн — твоя довжина\n/топ — топ 10\n/топ_все — усі гравці\n'
+        '/чат — загальна довжина\n/ролл — число від 1 до 100\n'
+        'Новий день — о 00:00 за часовим поясом гри (типово Москва). '
+        'Початкова довжина — 0 см; довжина може бути від’ємною. Рейтинги включають гравців, які використали /писюн.')
 
 
 class Game:
@@ -43,10 +43,10 @@ class Game:
         if command in {'/help', '/start'}:
             return HELP
         if message['chat']['type'] not in {'group', 'supergroup'}:
-            return 'Добавьте меня в беседу: игра и рейтинги работают в группах. /help — команды.'
+            return 'Додайте мене до чату: гра та рейтинги працюють у групах. /help — команди.'
         sender = message.get('from', {})
         if not sender or sender.get('is_bot') or message.get('sender_chat'):
-            return 'Для игры отправьте команду от своего личного аккаунта.'
+            return 'Для гри надішли команду зі свого особистого акаунта.'
         chat, user = message['chat']['id'], sender['id']
         name = ' '.join(sender.get(k, '') for k in ('first_name', 'last_name')).strip() or str(user)
         name = ' '.join(name.split())[:100]
@@ -59,19 +59,20 @@ class Game:
                 length, previous = self.db.execute('SELECT length,day FROM players WHERE chat=? AND user=?', (chat, user)).fetchone()
                 self.db.execute('UPDATE players SET name=? WHERE chat=? AND user=?', (name, chat, user))
                 if previous == day:
-                    return f'{name}, сегодня вы уже играли. Длина: {length} см. Приходите после полуночи ({self.zone.key}).'
+                    return f'{name}, сьогодні ти вже грав. Довжина твого писюна {length} см. Повертайся після опівночі ({self.zone.key}).'
                 delta = self.rng.choice((-1, 1)) * self.rng.randint(1, 10)
                 self.db.execute('UPDATE players SET length=length+?,day=? WHERE chat=? AND user=?', (delta, day, chat, user))
-            return f'{name}: {delta:+d} см. Теперь {length + delta} см!'
+            change = 'виріс' if delta > 0 else 'зменшився'
+            return f'{name}, твій пісюн {change} на {abs(delta)} см. Тепер його довжина {length + delta} см.'
         if command == '/мой_писюн':
             row = self.db.execute('SELECT length FROM players WHERE chat=? AND user=?', (chat, user)).fetchone()
-            return f'{name}: {row[0]} см.' if row else 'Вы ещё не играли в этой беседе. Начните с /писюн.'
+            return f'{name}, довжина твого писюна {row[0]} см.' if row else 'Ти ще не грав у цьому чаті. Почни з /писюн.'
         if command == '/чат':
-            total, count = self.db.execute('SELECT coalesce(sum(length),0),count(*) FROM players WHERE chat=?', (chat,)).fetchone()
-            return f'Суммарная длина: {total} см. Игроков: {count}.'
+            total = self.db.execute('SELECT coalesce(sum(length),0) FROM players WHERE chat=?', (chat,)).fetchone()[0]
+            return f'Довжина писюна вашого чату {total} см.'
         limit = ' LIMIT 10' if command == '/топ' else ''
         rows = self.db.execute('SELECT name,length FROM players WHERE chat=? ORDER BY length DESC,user ASC' + limit, (chat,)).fetchall()
-        return '\n'.join(f'{i}. {n}: {length} см' for i, (n, length) in enumerate(rows, 1)) or 'Пока нет игроков. Начните с /писюн.'
+        return '\n'.join(f'{i}. {n} - {length} см.' for i, (n, length) in enumerate(rows, 1)) or 'У чаті ще немає гравців. Почніть з /писюн.'
 
 
 class Telegram:

@@ -25,15 +25,15 @@ class GameTests(unittest.TestCase):
     def test_daily_limit_and_moscow_midnight(self):
         self.run_command('/писюн')
         first = self.run_command('/мой_писюн')
-        self.assertIn('уже играли', self.run_command('/писюн'))
+        self.assertIn('вже грав', self.run_command('/писюн'))
         self.assertEqual(first, self.run_command('/мой_писюн'))
-        self.assertNotIn('уже играли', self.run_command('/писюн', now=datetime(2026, 10, 27, 21, tzinfo=timezone.utc)))
+        self.assertNotIn('вже грав', self.run_command('/писюн', now=datetime(2026, 10, 27, 21, tzinfo=timezone.utc)))
 
     def test_chat_isolation(self):
         self.run_command('/писюн')
-        self.assertIn('ещё не играли', self.run_command('/мой_писюн', chat=-2))
-        self.assertIn('Игроков: 0', self.run_command('/чат', chat=-2))
-        self.assertNotIn('уже играли', self.run_command('/писюн', chat=-2))
+        self.assertIn('ще не грав', self.run_command('/мой_писюн', chat=-2))
+        self.assertEqual('Довжина писюна вашого чату 0 см.', self.run_command('/чат', chat=-2))
+        self.assertNotIn('вже грав', self.run_command('/писюн', chat=-2))
 
     def test_ranking_and_sum(self):
         for user in range(1, 13):
@@ -42,7 +42,7 @@ class GameTests(unittest.TestCase):
         self.assertEqual(len(self.run_command('/топ_все').splitlines()), 12)
         total = self.game.db.execute('SELECT sum(length) FROM players').fetchone()[0]
         self.assertIn(f'{total} см', self.run_command('/чат'))
-        values = [int(line.rsplit(': ', 1)[1].split()[0]) for line in self.run_command('/топ_все').splitlines()]
+        values = [int(line.rsplit(' - ', 1)[1].split()[0]) for line in self.run_command('/топ_все').splitlines()]
         self.assertEqual(values, sorted(values, reverse=True))
 
     def test_persistence(self):
