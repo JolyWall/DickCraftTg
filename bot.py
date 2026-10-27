@@ -13,6 +13,25 @@ from zoneinfo import ZoneInfo
 
 LOG = logging.getLogger(__name__)
 COMMANDS = {'/писюн', '/топ', '/топ_все', '/чат', '/ролл', '/мой_писюн', '/help', '/start'}
+ALIASES = {
+    '/grow': '/писюн', '/mine': '/мой_писюн', '/top': '/топ',
+    '/top_all': '/топ_все', '/chat': '/чат', '/roll': '/ролл',
+}
+MENU_COMMANDS = [
+    {'command': 'grow', 'description': 'Змінити довжину раз на день'},
+    {'command': 'mine', 'description': 'Моя довжина'},
+    {'command': 'top', 'description': 'Топ 10 гравців'},
+    {'command': 'top_all', 'description': 'Усі гравці'},
+    {'command': 'chat', 'description': 'Загальна довжина чату'},
+    {'command': 'roll', 'description': 'Випадкове число 1–100'},
+    {'command': 'help', 'description': 'Команди та правила'},
+]
+KEYBOARD = {
+    'keyboard': [['/писюн', '/мой_писюн'], ['/топ', '/топ_все'], ['/чат', '/ролл'], ['/help']],
+    'resize_keyboard': True,
+    'is_persistent': True,
+    'one_time_keyboard': False,
+}
 HELP = ('Команди гри:\n/писюн — змінити довжину раз на день на ±1–10 см\n'
         '/мой_писюн — твоя довжина\n/топ — топ 10\n/топ_все — усі гравці\n'
         '/чат — загальна довжина\n/ролл — число від 1 до 100\n'
@@ -38,6 +57,7 @@ class Game:
         command, _, target = words[0].partition('@')
         if target and target.casefold() != username.casefold():
             return None
+        command = ALIASES.get(command, command)
         if command not in COMMANDS:
             return None
         if command in {'/help', '/start'}:
@@ -116,6 +136,10 @@ def main():
             raise SystemExit('У бота активен webhook. Используйте отдельного бота или сначала отключите webhook.')
     except Exception as error:
         raise SystemExit(f'Не удалось подключиться к Telegram ({type(error).__name__}). Проверьте токен и сеть.') from None
+    try:
+        api.call('setMyCommands', commands=MENU_COMMANDS)
+    except Exception as error:
+        LOG.warning('Не вдалося оновити меню команд (%s)', type(error).__name__)
     LOG.info('Бот @%s запущен', me['username'])
     offset = 0
     while True:
@@ -126,7 +150,7 @@ def main():
                 answer = game.handle(message, me['username'])
                 if answer:
                     for part in chunks(answer):
-                        api.call('sendMessage', chat_id=message['chat']['id'], text=part)
+                        api.call('sendMessage', chat_id=message['chat']['id'], text=part, reply_markup=KEYBOARD)
                 offset = update['update_id'] + 1
         except KeyboardInterrupt:
             break

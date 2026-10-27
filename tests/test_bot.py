@@ -67,6 +67,15 @@ class GameTests(unittest.TestCase):
                     Game(self.path)
                 connect.assert_not_called()
 
+    def test_menu_aliases_share_results_and_daily_limit(self):
+        self.assertIn('см.', self.run_command('/grow@testbot'))
+        self.assertIn('вже грав', self.run_command('/писюн'))
+        for alias, original in (('/mine', '/мой_писюн'), ('/top', '/топ'),
+                                ('/top_all', '/топ_все'), ('/chat', '/чат')):
+            self.assertEqual(self.run_command(alias), self.run_command(original))
+        self.assertTrue(1 <= int(self.run_command('/roll').split()[-1]) <= 100)
+        self.assertIsNone(self.run_command('/grow@otherbot'))
+
     def test_chunking(self):
         parts = list(chunks('\n'.join(['А' * 100] * 100)))
         self.assertGreater(len(parts), 1)
