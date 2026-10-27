@@ -18,15 +18,6 @@ ALIASES = {
     '/grow': '/писюн', '/mine': '/мой_писюн', '/top': '/топ',
     '/top_all': '/топ_все', '/chat': '/чат', '/roll': '/ролл',
 }
-MENU_COMMANDS = [
-    {'command': 'grow', 'description': 'Змінити довжину раз на день'},
-    {'command': 'mine', 'description': 'Моя довжина'},
-    {'command': 'top', 'description': 'Топ 10 гравців'},
-    {'command': 'top_all', 'description': 'Усі гравці'},
-    {'command': 'chat', 'description': 'Загальна довжина чату'},
-    {'command': 'roll', 'description': 'Випадкове число 1–100'},
-    {'command': 'help', 'description': 'Команди та правила'},
-]
 KEYBOARD = {
     'keyboard': [['/писюн', '/мой_писюн'], ['/топ', '/топ_все'], ['/чат', '/ролл'], ['/help']],
     'resize_keyboard': True,
@@ -140,9 +131,9 @@ def main():
     except Exception as error:
         raise SystemExit(f'Не удалось подключиться к Telegram ({type(error).__name__}). Проверьте токен и сеть.') from None
     try:
-        api.call('setMyCommands', commands=MENU_COMMANDS)
+        api.call('deleteMyCommands')
     except Exception as error:
-        LOG.warning('Не вдалося оновити меню команд (%s)', type(error).__name__)
+        LOG.warning('Не вдалося видалити меню команд (%s)', type(error).__name__)
     LOG.info('Бот @%s запущен', me['username'])
     offset = 0
     while True:
