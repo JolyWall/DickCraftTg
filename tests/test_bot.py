@@ -3,6 +3,8 @@ import tempfile
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
+from unittest.mock import patch
+from zoneinfo import ZoneInfoNotFoundError
 
 from bot import Game, chunks
 
@@ -10,13 +12,11 @@ from bot import Game, chunks
 class GameTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
         self.path = Path(self.temp.name) / 'game.db'
         self.game = Game(self.path, rng=random.Random(42))
+        self.addCleanup(self.game.db.close)
         self.now = datetime(2026, 10, 27, 20, tzinfo=timezone.utc)
-
-    def tearDown(self):
-        self.game.db.close()
-        self.temp.cleanup()
 
     def run_command(self, command, user=1, chat=-1, now=None):
         return self.game.handle({'text': command, 'chat': {'id': chat, 'type': 'supergroup'},
@@ -59,6 +59,13 @@ class GameTests(unittest.TestCase):
         for _ in range(100):
             value = int(self.run_command('/ролл').split()[-1])
             self.assertTrue(1 <= value <= 100)
+
+    def test_missing_timezone_does_not_open_database(self):
+        with patch('bot.ZoneInfo', side_effect=ZoneInfoNotFoundError('missing')):
+            with patch('bot.sqlite3.connect') as connect:
+                with self.assertRaises(ZoneInfoNotFoundError):
+                    Game(self.path)
+                connect.assert_not_called()
 
     def test_chunking(self):
         parts = list(chunks('\n'.join(['А' * 100] * 100)))

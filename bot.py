@@ -22,13 +22,13 @@ HELP = ('Команды игры:\n/писюн — изменить длину �
 
 class Game:
     def __init__(self, path, timezone='Europe/Moscow', rng=None):
+        self.zone = ZoneInfo(timezone)
         self.db = sqlite3.connect(path)
         self.db.execute('PRAGMA journal_mode=WAL')
         self.db.execute('CREATE TABLE IF NOT EXISTS players '
                         '(chat INTEGER, user INTEGER, name TEXT NOT NULL, length INTEGER NOT NULL DEFAULT 0, '
                         'day TEXT, PRIMARY KEY(chat,user))')
         self.db.commit()
-        self.zone = ZoneInfo(timezone)
         self.rng = rng or random.SystemRandom()
 
     def handle(self, message, username='', now=None):
