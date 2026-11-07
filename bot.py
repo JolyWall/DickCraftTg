@@ -13,6 +13,7 @@ from zoneinfo import ZoneInfo
 
 LOG = logging.getLogger(__name__)
 GROWTH_CHANCE = 0.70
+RESET_CHANCE = 0.005
 COMMANDS = {'/писюн', '/топ', '/топ_все', '/чат', '/ролл', '/мой_писюн', '/help', '/start'}
 ALIASES = {
     '/grow': '/писюн', '/mine': '/мой_писюн', '/top': '/топ',
@@ -20,7 +21,7 @@ ALIASES = {
 }
 HELP = ('Команди гри:\n/писюн — змінити довжину раз на день на ±1–10 см\n'
         '/мой_писюн — твоя довжина\n/топ — топ 10\n/топ_все — усі гравці\n'
-        'Шанс зростання — 70%, зменшення — 30%.\n'
+        'За додатної довжини є шанс 0,5% втратити все. Інакше: зростання — 70%, зменшення — 30%.\n'
         '/чат — загальна довжина\n/ролл — число від 1 до 100\n'
         'Новий день — о 00:00 за часовим поясом гри (типово Москва). '
         'Початкова довжина — 0 см; довжина може бути від’ємною. Рейтинги включають гравців, які використали /писюн.')
@@ -67,6 +68,9 @@ class Game:
                 self.db.execute('UPDATE players SET name=? WHERE chat=? AND user=?', (name, chat, user))
                 if previous == day:
                     return f'{name}, сьогодні ти вже грав. Довжина твого писюна {length} см. Повертайся після опівночі ({self.zone.key}).'
+                if length > 0 and self.rng.random() < RESET_CHANCE:
+                    self.db.execute('UPDATE players SET length=0,day=? WHERE chat=? AND user=?', (day, chat, user))
+                    return f'{name}, твій пісюн відвалився 💀 Тепер його довжина 0 см.'
                 direction = 1 if self.rng.random() < GROWTH_CHANCE else -1
                 delta = direction * self.rng.randint(1, 10)
                 self.db.execute('UPDATE players SET length=length+?,day=? WHERE chat=? AND user=?', (delta, day, chat, user))

@@ -89,6 +89,43 @@ class GameTests(unittest.TestCase):
                 self.assertEqual(length, 6 if positive else -6)
                 self.assertIn('виріс' if positive else 'зменшився', answer)
 
+    def test_reset_boundary_daily_limit_and_next_day(self):
+        for user, roll, resets in ((201, 0.0, True), (202, 0.004999, True),
+                                   (203, 0.005, False)):
+            with self.subTest(roll=roll):
+                with self.game.db:
+                    self.game.db.execute('INSERT INTO players(chat,user,name,length) VALUES(?,?,?,?)',
+                                         (-1, user, 'Гравець', 179))
+                with patch.object(self.game.rng, 'random', side_effect=[roll, 0.1]):
+                    with patch.object(self.game.rng, 'randint', return_value=6):
+                        answer = self.run_command('/писюн', user=user)
+                self.assertEqual('відвалився' in answer, resets)
+                length = self.game.db.execute('SELECT length FROM players WHERE chat=-1 AND user=?', (user,)).fetchone()[0]
+                self.assertEqual(length, 0 if resets else 185)
+                with patch.object(self.game.rng, 'random') as draw:
+                    self.assertIn('вже грав', self.run_command('/grow', user=user))
+                    draw.assert_not_called()
+                if resets:
+                    other = Game(self.path)
+                    try:
+                        self.assertEqual(other.db.execute('SELECT length,day FROM players WHERE chat=-1 AND user=?', (user,)).fetchone(), (0, '2026-10-27'))
+                    finally:
+                        other.db.close()
+                    with patch.object(self.game.rng, 'random', return_value=0.0):
+                        with patch.object(self.game.rng, 'randint', return_value=6):
+                            self.assertIn('виріс на 6', self.run_command('/писюн', user=user,
+                                now=datetime(2026, 10, 28, 20, tzinfo=timezone.utc)))
+
+    def test_nonpositive_lengths_do_not_reset(self):
+        for user, length in ((301, 0), (302, -10)):
+            with self.game.db:
+                self.game.db.execute('INSERT INTO players(chat,user,name,length) VALUES(?,?,?,?)',
+                                     (-1, user, 'Гравець', length))
+            with patch.object(self.game.rng, 'random', return_value=0.0) as draw:
+                with patch.object(self.game.rng, 'randint', return_value=1):
+                    self.assertIn('виріс на 1', self.run_command('/писюн', user=user))
+                draw.assert_called_once()
+
     def test_chunking(self):
         parts = list(chunks('\n'.join(['А' * 100] * 100)))
         self.assertGreater(len(parts), 1)
