@@ -33,6 +33,15 @@ def connect_readonly(path):
     return sqlite3.connect(path.as_uri() + '?mode=ro', uri=True)
 
 
+def database_is_tracked(git, root, database_path):
+    """External database paths cannot be tracked by this checkout."""
+    try:
+        relative_path = database_path.relative_to(root)
+    except ValueError:
+        return False
+    return bool(git('--literal-pathspecs', 'ls-files', '--', relative_path.as_posix()))
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--service', help='systemd service name (prompted if omitted)')
@@ -72,7 +81,7 @@ def main():
         raise SystemExit('Expected repository root to equal the running bot working directory.')
     if git('status', '--porcelain', '--untracked-files=no'):
         raise SystemExit('Tracked files have local changes; preserve/review them before updating.')
-    if Path(git('ls-files', '--', str(db_path))).name:
+    if database_is_tracked(git, root, db_path):
         raise SystemExit('Database is tracked by Git; refusing deployment.')
     old_commit = git('rev-parse', 'HEAD')
     git('fetch', 'origin', 'main')
