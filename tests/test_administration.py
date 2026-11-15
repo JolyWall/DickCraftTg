@@ -51,6 +51,9 @@ class AdministrationTests(unittest.TestCase):
         self.handle(self.message('/grow'))
         self.assertEqual(self.game.db.execute('SELECT count(*) FROM players').fetchone()[0], 1)
         self.handle(self.message('/deny -10', 123, 123, 'private'))
+        version = self.game.db.execute('SELECT version FROM chats WHERE id=-10').fetchone()[0]
+        self.handle({'callback_query': {'id':'confirm', 'from':{'id':123},
+                     'message':{'chat':{'id':123,'type':'private'}}, 'data':f'deny:-10:{version}'}})
         self.api.reset_mock()
         self.handle(self.message('/roll'))
         self.assertIn('запретил', self.api.call.call_args.kwargs['text'])
@@ -65,7 +68,7 @@ class AdministrationTests(unittest.TestCase):
         self.handle(self.message('/grow'))
         for user, kind in [(1, 'private'), (123, 'supergroup'), (123, 'private')]:
             self.handle({'callback_query': {'id': 'q', 'from': {'id': user},
-                         'message': {'chat': {'id': 123, 'type': kind}}, 'data': 'approve:-10'}})
+                         'message': {'chat': {'id': 123, 'type': kind}}, 'data': 'approve:-10:1'}})
             expected = 'approved' if (user, kind) == (123, 'private') else 'pending'
             self.assertEqual(self.game.db.execute('SELECT status FROM chats').fetchone()[0], expected)
 

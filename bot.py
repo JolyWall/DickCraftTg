@@ -11,6 +11,8 @@ from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 from zoneinfo import ZoneInfo
 
+from reliability import Delivery, TelegramError, transaction
+
 LOG = logging.getLogger(__name__)
 GROWTH_CHANCE = 0.70
 COMMANDS = {'/писюн', '/топ', '/топ_все', '/чат', '/ролл', '/мой_писюн', '/help', '/start'}
@@ -61,7 +63,7 @@ class Game:
             return f'{name}: 🎲 {self.rng.randint(1, 100)}'
         day = (now or datetime.now(self.zone)).astimezone(self.zone).date().isoformat()
         if command == '/писюн':
-            with self.db:
+            with transaction(self.db):
                 self.db.execute('INSERT OR IGNORE INTO players(chat,user,name) VALUES(?,?,?)', (chat, user, name))
                 length, previous = self.db.execute('SELECT length,day FROM players WHERE chat=? AND user=?', (chat, user)).fetchone()
                 self.db.execute('UPDATE players SET name=? WHERE chat=? AND user=?', (name, chat, user))
@@ -90,19 +92,30 @@ class Administration:
             raise ValueError('OWNER_ID must be a positive Telegram user ID')
         self.game = game
         self.owner_id = owner_id
-        with game.db:
+        with transaction(game.db):
             game.db.execute("CREATE TABLE IF NOT EXISTS chats (id INTEGER PRIMARY KEY, "
                             "title TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending' "
                             "CHECK(status IN ('pending','approved','denied')))")
+            columns = {row[1] for row in game.db.execute('PRAGMA table_info(chats)')}
+            for name, definition in [('requested_at', 'INTEGER NOT NULL DEFAULT 0'),
+                                     ('version', 'INTEGER NOT NULL DEFAULT 1')]:
+                if name not in columns:
+                    game.db.execute(f'ALTER TABLE chats ADD COLUMN {name} {definition}')
+            game.db.execute('CREATE TABLE IF NOT EXISTS decisions '
+                            '(id INTEGER PRIMARY KEY,chat INTEGER,at INTEGER,actor INTEGER,old TEXT,new TEXT)')
+            game.db.execute('CREATE INDEX IF NOT EXISTS decision_chat ON decisions(chat,id)')
+            game.db.execute('CREATE TABLE IF NOT EXISTS confirmations '
+                            '(chat INTEGER PRIMARY KEY,version INTEGER,expires INTEGER)')
+
 
     def register(self, chat):
-        with self.game.db:
+        with transaction(self.game.db):
             cursor = self.game.db.execute(
-                'INSERT OR IGNORE INTO chats(id,title) VALUES(?,?)',
-                (chat['id'], chat.get('title', str(chat['id']))[:200]))
+                'INSERT OR IGNORE INTO chats(id,title,requested_at) VALUES(?,?,?)',
+                (chat['id'], ' '.join(chat.get('title', str(chat['id'])).split())[:200], int(time.time())))
             created = cursor.rowcount == 1
             self.game.db.execute('UPDATE chats SET title=? WHERE id=?',
-                                 (chat.get('title', str(chat['id']))[:200], chat['id']))
+                                 (' '.join(chat.get('title', str(chat['id'])).split())[:200], chat['id']))
         return created
 
     def notify_owner(self, api, chat, repeated=False):
@@ -111,21 +124,21 @@ class Administration:
         try:
             self.send(api, self.owner_id,
                       f"{heading}\nБеседа: {title}\nID: {chat['id']}\n"
-                      f"Разрешить: /approve {chat['id']}\nЗапретить: /deny {chat['id']}")
+                      f"Разрешить: /approve {chat['id']}\nЗапретить: /deny {chat['id']}",
+                      {'inline_keyboard': [[{'text': 'Открыть заявку', 'callback_data': f"view:{chat['id']}"}]]})
         except Exception as error:
             # The persisted request remains available even if Telegram blocks the DM.
             LOG.warning('Уведомление о заявке чата %s не доставлено владельцу (%s); проверьте /pending',
                         chat['id'], type(error).__name__)
 
-    def buttons(self, chat_id):
-        return {'inline_keyboard': [[
-            {'text': 'Разрешить', 'callback_data': f'approve:{chat_id}'},
-            {'text': 'Запретить', 'callback_data': f'deny:{chat_id}'}]]}
-
     def decide(self, action, chat_id):
         status = 'approved' if action == 'approve' else 'denied'
-        with self.game.db:
-            changed = self.game.db.execute('UPDATE chats SET status=? WHERE id=?',
+        with transaction(self.game.db):
+            previous = self.game.db.execute('SELECT status FROM chats WHERE id=?', (chat_id,)).fetchone()
+            if previous and previous[0] != status:
+                self.game.db.execute('INSERT INTO decisions(chat,at,actor,old,new) VALUES(?,?,?,?,?)',
+                                     (chat_id, int(time.time()), self.owner_id, previous[0], status))
+            changed = self.game.db.execute('UPDATE chats SET status=?,version=version+1 WHERE id=?',
                                            (status, chat_id)).rowcount
         return f'Чат {chat_id}: {status}.' if changed else 'Чат не найден.'
 
@@ -133,6 +146,56 @@ class Administration:
         for part in chunks(text):
             api.call('sendMessage', chat_id=chat_id, text=part,
                      reply_markup=markup or {'remove_keyboard': True})
+
+    def panel(self, api, section='all', page=0):
+        page = max(0, page)
+        where = " WHERE status='pending'" if section == 'pending' else ''
+        total = self.game.db.execute('SELECT count(*) FROM chats' + where).fetchone()[0]
+        page = min(page, max(0, (total-1)//5))
+        rows = self.game.db.execute('SELECT id,title,status FROM chats' + where +
+                                    ' ORDER BY requested_at DESC,id LIMIT 5 OFFSET ?', (page*5,)).fetchall()
+        keyboard = [[{'text': f'{title[:35]} · {status}', 'callback_data': f'view:{cid}'}]
+                    for cid, title, status in rows]
+        nav = []
+        if page:
+            nav.append({'text': '←', 'callback_data': f'list:{section}:{page-1}'})
+        if (page+1)*5 < total:
+            nav.append({'text': '→', 'callback_data': f'list:{section}:{page+1}'})
+        if nav:
+            keyboard.append(nav)
+        keyboard.append([{'text': 'Все беседы', 'callback_data': 'list:all:0'},
+                         {'text': 'Заявки', 'callback_data': 'list:pending:0'}])
+        queue = ''
+        if self.game.db.execute("SELECT 1 FROM sqlite_master WHERE name='delivery' AND type='table'").fetchone():
+            counts = dict(self.game.db.execute('SELECT state,count(*) FROM delivery GROUP BY state'))
+            queue = f"Доставка: ожидают {counts.get('pending',0)}, ошибок {counts.get('failed',0)}. /retry_delivery — повторить ошибки.\n"
+        self.send(api, self.owner_id, queue + f'Панель владельца · страница {page+1} · бесед: {total}\n'
+                  '/find ID — найти беседу; /history ID — история решений.\n' +
+                  ('\n'.join(f'{title} | {cid} | {status}' for cid,title,status in rows) or 'Чатов нет.'),
+                  {'inline_keyboard': keyboard})
+
+    def detail(self, api, cid):
+        row = self.game.db.execute('SELECT title,status,requested_at,version FROM chats WHERE id=?', (cid,)).fetchone()
+        if not row:
+            self.send(api, self.owner_id, 'Чат не найден.')
+            return
+        title, status, requested, version = row
+        date = datetime.fromtimestamp(requested, self.game.zone).strftime('%d.%m.%Y %H:%M') if requested else 'до обновления'
+        self.send(api, self.owner_id, f'{title}\nID: {cid}\nСтатус: {status}\nЗаявка: {date}\n/history {cid}',
+                  {'inline_keyboard': [[{'text': 'Разрешить', 'callback_data': f'approve:{cid}:{version}'},
+                                        {'text': 'Запретить', 'callback_data': f'confirm:{cid}:{version}'}]]})
+
+    def confirm_denial(self, api, cid, version):
+        row = self.game.db.execute('SELECT title,version FROM chats WHERE id=?', (cid,)).fetchone()
+        if not row or row[1] != version:
+            self.send(api, self.owner_id, 'Данные устарели. Откройте беседу заново через /chats.')
+            return
+        with transaction(self.game.db):
+            self.game.db.execute('INSERT OR REPLACE INTO confirmations VALUES(?,?,?)',
+                                 (cid, version, int(time.time())+300))
+        self.send(api, self.owner_id, f'Отключить бота в беседе «{row[0]}» ({cid})?',
+                  {'inline_keyboard': [[{'text': 'Да, отключить', 'callback_data': f'deny:{cid}:{version}'},
+                                        {'text': 'Отмена', 'callback_data': f'cancel:{cid}'}]]})
 
     def handle(self, update, api, username):
         callback = update.get('callback_query')
@@ -144,16 +207,38 @@ class Administration:
                 api.call('answerCallbackQuery', callback_query_id=callback['id'],
                          text='Доступ запрещён.', show_alert=True)
                 return
-            action, _, value = callback.get('data', '').partition(':')
+            parts = callback.get('data', '').split(':')
+            # Callback acknowledgement is immediate; messages themselves are queued.
+            api.call('answerCallbackQuery', callback_query_id=callback['id'])
             try:
-                chat_id = int(value)
-            except ValueError:
-                return
-            if action not in {'approve', 'deny'}:
-                return
-            result = self.decide(action, chat_id)
-            api.call('answerCallbackQuery', callback_query_id=callback['id'], text=result)
-            self.send(api, self.owner_id, result)
+                action = parts[0]
+                if action == 'list' and len(parts) == 3 and parts[1] in {'all', 'pending'}:
+                    self.panel(api, parts[1], int(parts[2]))
+                    return
+                cid = int(parts[1])
+                if action == 'view':
+                    self.detail(api, cid)
+                    return
+                if action == 'cancel':
+                    with transaction(self.game.db):
+                        self.game.db.execute('DELETE FROM confirmations WHERE chat=?', (cid,))
+                    self.send(api, self.owner_id, 'Отменено.')
+                    return
+                row = self.game.db.execute('SELECT version FROM chats WHERE id=?', (cid,)).fetchone()
+                if not row or len(parts) != 3 or int(parts[2]) != row[0]:
+                    self.send(api, self.owner_id, 'Данные устарели. Откройте беседу заново через /chats.')
+                    return
+                if action == 'confirm':
+                    self.confirm_denial(api, cid, row[0])
+                elif action in {'approve', 'deny'}:
+                    if action == 'deny':
+                        confirmation = self.game.db.execute('SELECT version,expires FROM confirmations WHERE chat=?', (cid,)).fetchone()
+                        if not confirmation or confirmation[0] != row[0] or confirmation[1] < time.time():
+                            self.send(api, self.owner_id, 'Подтверждение истекло. Откройте беседу заново.')
+                            return
+                    self.send(api, self.owner_id, self.decide(action, cid))
+            except (ValueError, IndexError, OverflowError):
+                self.send(api, self.owner_id, 'Некорректная кнопка. Откройте /admin.')
             return
 
         member = update.get('my_chat_member')
@@ -181,10 +266,10 @@ class Administration:
                     self.send(api, chat['id'], 'Подать заявку может только владелец или администратор беседы.')
                     return
                 created = self.register(chat)
-                with self.game.db:
+                with transaction(self.game.db):
                     reopened = self.game.db.execute(
-                        "UPDATE chats SET status='pending' WHERE id=? AND status='denied'",
-                        (chat['id'],)).rowcount
+                        "UPDATE chats SET status='pending',version=version+1,requested_at=? WHERE id=? AND status='denied'",
+                        (int(time.time()), chat['id'])).rowcount
                     status = self.game.db.execute('SELECT status FROM chats WHERE id=?',
                                                   (chat['id'],)).fetchone()[0]
                 if status == 'approved':
@@ -204,6 +289,8 @@ class Administration:
                 self.notify_owner(api, chat)
             status = self.game.db.execute('SELECT status FROM chats WHERE id=?', (chat['id'],)).fetchone()[0]
             if status != 'approved':
+                if hasattr(api, 'allow') and not api.allow(f'notice:{chat["id"]}', 1, 60):
+                    return
                 self.send(api, chat['id'], 'Для работы бота необходима верификация этой беседы. '
                           'Заявка создана автоматически и ожидает одобрения владельцем бота.' if status == 'pending'
                           else 'Владелец запретил работу бота в этом чате. '
@@ -217,27 +304,42 @@ class Administration:
             command, _, target = (words[0] if words else '').partition('@')
             if target and target.casefold() != username.casefold():
                 return
-            if command in {'/admin', '/pending', '/chats', '/approve', '/deny'}:
+            if command in {'/admin', '/pending', '/chats', '/approve', '/deny', '/find', '/history', '/retry_delivery'}:
                 if sender.get('id') != self.owner_id or chat['id'] != self.owner_id:
                     self.send(api, chat['id'], 'Доступ запрещён.')
                     return
-                if command == '/admin':
-                    self.send(api, chat['id'], 'Панель владельца\n/pending — заявки\n/chats — все чаты\n'
-                              '/approve ID — разрешить\n/deny ID — запретить (в том числе ранее разрешённый чат)')
-                elif command in {'/pending', '/chats'}:
-                    query = 'SELECT id,title,status FROM chats'
-                    if command == '/pending':
-                        query += " WHERE status='pending'"
-                    rows = self.game.db.execute(query + ' ORDER BY id').fetchall()
-                    self.send(api, chat['id'], '\n'.join(f'{title} | {cid} | {status}'
-                              for cid, title, status in rows) or 'Чатов нет.')
+                if command == '/retry_delivery':
+                    if self.game.db.execute("SELECT 1 FROM sqlite_master WHERE name='delivery' AND type='table'").fetchone():
+                        with transaction(self.game.db):
+                            self.game.db.execute("UPDATE delivery SET state='pending',due=?,attempts=0 WHERE state='failed'", (time.time(),))
+                    self.send(api, self.owner_id, 'Доставка сообщений с постоянными ошибками запрошена повторно.')
+                    return
+                if command in {'/admin', '/chats', '/pending'}:
+                    self.panel(api, 'pending' if command == '/pending' else 'all',
+                               int(words[1])-1 if len(words) == 2 and words[1].isdigit() else 0)
                 else:
                     try:
                         cid = int(words[1]) if len(words) == 2 else None
+                        if cid is None or not -(2**63) <= cid < 2**63:
+                            raise ValueError
                     except ValueError:
-                        cid = None
-                    self.send(api, chat['id'], self.decide(command[1:], cid) if cid is not None
-                              else f'Использование: {command} ID')
+                        self.send(api, chat['id'], f'Использование: {command} ID')
+                        return
+                    if command == '/find':
+                        self.detail(api, cid)
+                    elif command == '/history':
+                        rows = self.game.db.execute('SELECT at,actor,old,new FROM decisions WHERE chat=? ORDER BY id DESC LIMIT 20', (cid,)).fetchall()
+                        self.send(api, self.owner_id, '\n'.join(
+                            f'{datetime.fromtimestamp(at,self.game.zone):%d.%m.%Y %H:%M} · {actor}: {old} → {new}'
+                            for at,actor,old,new in rows) or 'История решений пуста.')
+                    elif command == '/deny':
+                        row = self.game.db.execute('SELECT status,version FROM chats WHERE id=?', (cid,)).fetchone()
+                        if row and row[0] == 'approved':
+                            self.confirm_denial(api, cid, row[1])
+                        else:
+                            self.send(api, self.owner_id, self.decide('deny', cid))
+                    else:
+                        self.send(api, self.owner_id, self.decide('approve', cid))
                 return
         answer = self.game.handle(message, username)
         if answer:
@@ -251,13 +353,19 @@ class Telegram:
     def call(self, method, **params):
         request = Request(self.base + method, data=json.dumps(params).encode(), headers={'Content-Type': 'application/json'})
         try:
-            with urlopen(request, timeout=40) as response:
+            with urlopen(request, timeout=40 if method == 'getUpdates' else 10) as response:
                 result = json.load(response)
         except HTTPError as error:
             # Do not log exception URLs: they contain the bot token.
-            raise RuntimeError(f'Telegram HTTP {error.code}') from None
+            try:
+                details = json.load(error)
+                delay = int(details.get('parameters', {}).get('retry_after', 0))
+            except (ValueError, TypeError):
+                delay = 0
+            raise TelegramError(error.code, delay) from None
         if not result.get('ok'):
-            raise RuntimeError('Telegram rejected request')
+            raise TelegramError(int(result.get('error_code', 500)),
+                                int(result.get('parameters', {}).get('retry_after', 0)))
         return result['result']
 
 
@@ -297,20 +405,20 @@ def main():
     except Exception as error:
         LOG.warning('Не вдалося видалити меню команд (%s)', type(error).__name__)
     LOG.info('Бот @%s запущен', me['username'])
-    offset = 0
+    delivery = Delivery(game.db, api)
     while True:
         try:
-            updates = api.call('getUpdates', offset=offset, timeout=25,
+            delivery.flush()
+            updates = api.call('getUpdates', offset=delivery.offset, timeout=1,
                                allowed_updates=['message', 'my_chat_member', 'callback_query'])
             for update in updates:
-                try:
-                    administration.handle(update, api, me['username'])
-                except Exception as error:
-                    LOG.warning('Ошибка обновления %s (%s)', update['update_id'], type(error).__name__)
-                # A failed reply must not block approval requests and other chats.
-                offset = update['update_id'] + 1
+                delivery.process(update, administration, me['username'])
+            delivery.flush()
         except KeyboardInterrupt:
             break
+        except TelegramError as error:
+            LOG.warning('Ошибка Telegram HTTP %s', error.code)
+            time.sleep(max(5, error.retry_after))
         except Exception as error:
             LOG.warning('Ошибка обработки (%s); повтор через 5 секунд', type(error).__name__)
             time.sleep(5)
