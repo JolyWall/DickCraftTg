@@ -105,6 +105,18 @@ class Administration:
                                  (chat.get('title', str(chat['id']))[:200], chat['id']))
         return created
 
+    def notify_owner(self, api, chat, repeated=False):
+        title = ' '.join(chat.get('title', str(chat['id'])).split())[:200]
+        heading = 'Повторная заявка на авторизацию' if repeated else 'Новая заявка на авторизацию'
+        try:
+            self.send(api, self.owner_id,
+                      f"{heading}\nБеседа: {title}\nID: {chat['id']}\n"
+                      f"Разрешить: /approve {chat['id']}\nЗапретить: /deny {chat['id']}")
+        except Exception as error:
+            # The persisted request remains available even if Telegram blocks the DM.
+            LOG.warning('Уведомление о заявке чата %s не доставлено владельцу (%s); проверьте /pending',
+                        chat['id'], type(error).__name__)
+
     def buttons(self, chat_id):
         return {'inline_keyboard': [[
             {'text': 'Разрешить', 'callback_data': f'approve:{chat_id}'},
@@ -178,6 +190,7 @@ class Administration:
                 if status == 'approved':
                     text = 'Беседа уже верифицирована. Повторная заявка не требуется.'
                 elif created or reopened:
+                    self.notify_owner(api, chat, repeated=bool(reopened))
                     text = 'Заявка на верификацию подана. Ожидайте решения владельца бота.'
                 else:
                     text = 'Заявка уже ожидает решения владельца бота. Повторная заявка не создана.'
@@ -186,7 +199,9 @@ class Administration:
             relevant = member or command in COMMANDS or command in ALIASES
             if not relevant:
                 return
-            self.register(chat)
+            created = self.register(chat)
+            if created:
+                self.notify_owner(api, chat)
             status = self.game.db.execute('SELECT status FROM chats WHERE id=?', (chat['id'],)).fetchone()[0]
             if status != 'approved':
                 self.send(api, chat['id'], 'Для работы бота необходима верификация этой беседы. '

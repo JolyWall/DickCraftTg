@@ -24,23 +24,25 @@ class AdministrationTests(unittest.TestCase):
     def handle(self, update):
         self.admin.handle(update, self.api, 'testbot')
 
-    def test_pending_blocks_game_and_notifies_only_group(self):
+    def test_pending_blocks_game_and_notifies_owner_once(self):
         self.handle(self.message('/grow'))
         self.assertEqual(self.game.db.execute('SELECT count(*) FROM players').fetchone()[0], 0)
-        self.assertEqual(self.api.call.call_count, 1)
+        self.assertEqual(self.api.call.call_count, 2)
         self.assertEqual(self.api.call.call_args.kwargs['chat_id'], -10)
         self.assertIn('верификация', self.api.call.call_args.kwargs['text'])
         self.handle(self.message('/roll'))
-        self.assertTrue(all(c.kwargs.get('chat_id') == -10
-                            for c in self.api.call.call_args_list))
+        notifications = [c for c in self.api.call.call_args_list if c.kwargs.get('chat_id') == 123]
+        self.assertEqual(len(notifications), 1)
+        self.assertIn('Новая заявка', notifications[0].kwargs['text'])
+        self.assertIn('/approve -10', notifications[0].kwargs['text'])
 
-    def test_join_announces_verification_without_private_messages(self):
+    def test_join_announces_verification_and_notifies_bot_owner_only(self):
         self.handle({'my_chat_member': {
             'chat': {'id': -10, 'type': 'group', 'title': 'Group'},
+            'from': {'id': 456},
             'new_chat_member': {'status': 'member'}}})
-        self.api.call.assert_called_once()
-        self.assertEqual(self.api.call.call_args.args, ('sendMessage',))
-        self.assertEqual(self.api.call.call_args.kwargs['chat_id'], -10)
+        self.assertEqual(self.api.call.call_count, 2)
+        self.assertEqual([c.kwargs['chat_id'] for c in self.api.call.call_args_list], [123, -10])
         self.assertIn('верификация', self.api.call.call_args.kwargs['text'])
 
     def test_owner_approval_and_revocation(self):
@@ -83,7 +85,7 @@ class AdministrationTests(unittest.TestCase):
         Administration(other, 123)
         self.assertEqual(other.db.execute('SELECT status FROM chats').fetchone()[0], 'approved')
 
-    def test_request_available_in_owner_panel_without_notification(self):
+    def test_request_available_in_owner_panel(self):
         self.handle(self.message('/grow'))
         self.api.reset_mock()
         self.handle(self.message('/pending', 123, 123, 'private'))
@@ -99,7 +101,9 @@ class AdministrationTests(unittest.TestCase):
         self.assertIn('Повторная заявка не создана', self.api.call.call_args.kwargs['text'])
         self.assertEqual(self.game.db.execute(
             "SELECT count(*) FROM chats WHERE id=-10 AND status='pending'").fetchone()[0], 1)
-        self.assertTrue(all(c.kwargs.get('chat_id') == -10 for c in self.api.call.call_args_list))
+        notices = [c for c in self.api.call.call_args_list if c.kwargs.get('chat_id') == 123]
+        self.assertEqual(len(notices), 2)
+        self.assertIn('Повторная заявка', notices[-1].kwargs['text'])
 
     def test_creator_can_reapply_but_members_cannot(self):
         self.handle(self.message('/grow'))
@@ -157,6 +161,36 @@ class AdministrationTests(unittest.TestCase):
         admin.decide('approve', -10)
         self.assertEqual(upgraded.db.execute('SELECT * FROM players ORDER BY chat,user').fetchall(), expected)
         self.assertEqual(upgraded.db.execute('PRAGMA integrity_check').fetchone()[0], 'ok')
+
+    def test_failed_owner_notification_preserves_request_and_group_reply(self):
+        def call(method, **params):
+            if params.get('chat_id') == 123:
+                raise RuntimeError('Forbidden')
+        self.api.call.side_effect = call
+        with self.assertLogs('bot', level='WARNING'):
+            self.handle(self.message('/grow'))
+        self.assertEqual(self.game.db.execute('SELECT status FROM chats').fetchone()[0], 'pending')
+        self.assertEqual(self.api.call.call_args.kwargs['chat_id'], -10)
+        self.api.call.side_effect = None
+        self.handle(self.message('/pending', 123, 123, 'private'))
+        self.assertIn('-10', self.api.call.call_args.kwargs['text'])
+
+    def test_pending_request_does_not_notify_again_after_restart(self):
+        self.handle(self.message('/grow'))
+        other = Game(self.path)
+        self.addCleanup(other.db.close)
+        admin = Administration(other, 123)
+        self.api.reset_mock()
+        admin.handle(self.message('/grow'), self.api, 'testbot')
+        self.assertEqual(self.api.call.call_count, 1)
+        self.assertEqual(self.api.call.call_args.kwargs['chat_id'], -10)
+
+    def test_verify_creates_new_request_and_notifies_owner(self):
+        self.api.call.return_value = {'status': 'administrator'}
+        self.handle(self.message('/verify'))
+        notices = [c for c in self.api.call.call_args_list if c.kwargs.get('chat_id') == 123]
+        self.assertEqual(len(notices), 1)
+        self.assertIn('Новая заявка', notices[0].kwargs['text'])
 
     def test_malformed_command_and_unknown_chat(self):
         for text in ['/approve', '/deny abc', '/approve -999']:
