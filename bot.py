@@ -83,6 +83,152 @@ class Game:
         return '\n'.join(f'{i}. {n} - {length} см.' for i, (n, length) in enumerate(rows, 1)) or 'У чаті ще немає гравців. Почніть з /писюн.'
 
 
+class Administration:
+    """Owner-only controls and a persistent, default-deny group allowlist."""
+    def __init__(self, game, owner_id):
+        if owner_id <= 0:
+            raise ValueError('OWNER_ID must be a positive Telegram user ID')
+        self.game = game
+        self.owner_id = owner_id
+        with game.db:
+            game.db.execute("CREATE TABLE IF NOT EXISTS chats (id INTEGER PRIMARY KEY, "
+                            "title TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending' "
+                            "CHECK(status IN ('pending','approved','denied')))")
+
+    def register(self, chat):
+        with self.game.db:
+            cursor = self.game.db.execute(
+                'INSERT OR IGNORE INTO chats(id,title) VALUES(?,?)',
+                (chat['id'], chat.get('title', str(chat['id']))[:200]))
+            created = cursor.rowcount == 1
+            self.game.db.execute('UPDATE chats SET title=? WHERE id=?',
+                                 (chat.get('title', str(chat['id']))[:200], chat['id']))
+        return created
+
+    def buttons(self, chat_id):
+        return {'inline_keyboard': [[
+            {'text': 'Разрешить', 'callback_data': f'approve:{chat_id}'},
+            {'text': 'Запретить', 'callback_data': f'deny:{chat_id}'}]]}
+
+    def decide(self, action, chat_id):
+        status = 'approved' if action == 'approve' else 'denied'
+        with self.game.db:
+            changed = self.game.db.execute('UPDATE chats SET status=? WHERE id=?',
+                                           (status, chat_id)).rowcount
+        return f'Чат {chat_id}: {status}.' if changed else 'Чат не найден.'
+
+    def send(self, api, chat_id, text, markup=None):
+        for part in chunks(text):
+            api.call('sendMessage', chat_id=chat_id, text=part,
+                     reply_markup=markup or {'remove_keyboard': True})
+
+    def handle(self, update, api, username):
+        callback = update.get('callback_query')
+        if callback:
+            message = callback.get('message', {})
+            if (callback.get('from', {}).get('id') != self.owner_id or
+                    message.get('chat', {}).get('type') != 'private' or
+                    message.get('chat', {}).get('id') != self.owner_id):
+                api.call('answerCallbackQuery', callback_query_id=callback['id'],
+                         text='Доступ запрещён.', show_alert=True)
+                return
+            action, _, value = callback.get('data', '').partition(':')
+            try:
+                chat_id = int(value)
+            except ValueError:
+                return
+            if action not in {'approve', 'deny'}:
+                return
+            result = self.decide(action, chat_id)
+            api.call('answerCallbackQuery', callback_query_id=callback['id'], text=result)
+            self.send(api, self.owner_id, result)
+            return
+
+        member = update.get('my_chat_member')
+        message = update.get('message', {})
+        chat = (member or message).get('chat', {})
+        if chat.get('type') in {'group', 'supergroup'}:
+            if member and member.get('new_chat_member', {}).get('status') not in {'member', 'administrator'}:
+                return
+            words = message.get('text', '').split()
+            command, _, target = (words[0] if words else '').partition('@')
+            if target and target.casefold() != username.casefold():
+                return
+            if command == '/verify' and not member:
+                sender = message.get('from', {})
+                if not sender or sender.get('is_bot') or message.get('sender_chat'):
+                    self.send(api, chat['id'], 'Подать заявку может владелец или администратор беседы со своего личного аккаунта.')
+                    return
+                try:
+                    membership = api.call('getChatMember', chat_id=chat['id'], user_id=sender['id'])
+                except Exception:
+                    self.send(api, chat['id'], 'Не удалось проверить права администратора. Попробуйте позже; '
+                              'для надёжной проверки бот должен быть администратором беседы.')
+                    return
+                if membership.get('status') not in {'creator', 'administrator'}:
+                    self.send(api, chat['id'], 'Подать заявку может только владелец или администратор беседы.')
+                    return
+                created = self.register(chat)
+                with self.game.db:
+                    reopened = self.game.db.execute(
+                        "UPDATE chats SET status='pending' WHERE id=? AND status='denied'",
+                        (chat['id'],)).rowcount
+                    status = self.game.db.execute('SELECT status FROM chats WHERE id=?',
+                                                  (chat['id'],)).fetchone()[0]
+                if status == 'approved':
+                    text = 'Беседа уже верифицирована. Повторная заявка не требуется.'
+                elif created or reopened:
+                    text = 'Заявка на верификацию подана. Ожидайте решения владельца бота.'
+                else:
+                    text = 'Заявка уже ожидает решения владельца бота. Повторная заявка не создана.'
+                self.send(api, chat['id'], text)
+                return
+            relevant = member or command in COMMANDS or command in ALIASES
+            if not relevant:
+                return
+            self.register(chat)
+            status = self.game.db.execute('SELECT status FROM chats WHERE id=?', (chat['id'],)).fetchone()[0]
+            if status != 'approved':
+                self.send(api, chat['id'], 'Для работы бота необходима верификация этой беседы. '
+                          'Заявка создана автоматически и ожидает одобрения владельцем бота.' if status == 'pending'
+                          else 'Владелец запретил работу бота в этом чате. '
+                          'Владелец или администратор беседы может подать заявку повторно: /verify.')
+                return
+            if member:
+                return
+        elif chat.get('type') == 'private':
+            sender = message.get('from', {})
+            words = message.get('text', '').split()
+            command, _, target = (words[0] if words else '').partition('@')
+            if target and target.casefold() != username.casefold():
+                return
+            if command in {'/admin', '/pending', '/chats', '/approve', '/deny'}:
+                if sender.get('id') != self.owner_id or chat['id'] != self.owner_id:
+                    self.send(api, chat['id'], 'Доступ запрещён.')
+                    return
+                if command == '/admin':
+                    self.send(api, chat['id'], 'Панель владельца\n/pending — заявки\n/chats — все чаты\n'
+                              '/approve ID — разрешить\n/deny ID — запретить (в том числе ранее разрешённый чат)')
+                elif command in {'/pending', '/chats'}:
+                    query = 'SELECT id,title,status FROM chats'
+                    if command == '/pending':
+                        query += " WHERE status='pending'"
+                    rows = self.game.db.execute(query + ' ORDER BY id').fetchall()
+                    self.send(api, chat['id'], '\n'.join(f'{title} | {cid} | {status}'
+                              for cid, title, status in rows) or 'Чатов нет.')
+                else:
+                    try:
+                        cid = int(words[1]) if len(words) == 2 else None
+                    except ValueError:
+                        cid = None
+                    self.send(api, chat['id'], self.decide(command[1:], cid) if cid is not None
+                              else f'Использование: {command} ID')
+                return
+        answer = self.game.handle(message, username)
+        if answer:
+            self.send(api, chat['id'], answer)
+
+
 class Telegram:
     def __init__(self, token):
         self.base = f'https://api.telegram.org/bot{token}/'
@@ -114,9 +260,16 @@ def main():
     token = os.environ.get('BOT_TOKEN')
     if not token:
         raise SystemExit('Задайте BOT_TOKEN через защищённые переменные окружения.')
+    try:
+        owner_id = int(os.environ.get('OWNER_ID', ''))
+        if owner_id <= 0:
+            raise ValueError
+    except ValueError:
+        raise SystemExit('Задайте OWNER_ID: положительный числовой Telegram ID владельца.') from None
     path = Path(os.environ.get('DB_PATH', 'data/game.sqlite3'))
     path.parent.mkdir(parents=True, exist_ok=True)
     game = Game(path, os.environ.get('GAME_TIMEZONE', 'Europe/Moscow'))
+    administration = Administration(game, owner_id)
     api = Telegram(token)
     try:
         me = api.call('getMe')
@@ -132,13 +285,14 @@ def main():
     offset = 0
     while True:
         try:
-            updates = api.call('getUpdates', offset=offset, timeout=25, allowed_updates=['message'])
+            updates = api.call('getUpdates', offset=offset, timeout=25,
+                               allowed_updates=['message', 'my_chat_member', 'callback_query'])
             for update in updates:
-                message = update.get('message', {})
-                answer = game.handle(message, me['username'])
-                if answer:
-                    for part in chunks(answer):
-                        api.call('sendMessage', chat_id=message['chat']['id'], text=part, reply_markup={'remove_keyboard': True})
+                try:
+                    administration.handle(update, api, me['username'])
+                except Exception as error:
+                    LOG.warning('Ошибка обновления %s (%s)', update['update_id'], type(error).__name__)
+                # A failed reply must not block approval requests and other chats.
                 offset = update['update_id'] + 1
         except KeyboardInterrupt:
             break
